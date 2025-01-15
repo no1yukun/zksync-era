@@ -1,24 +1,36 @@
+use std::{collections::HashMap, iter::once};
+
+use anyhow::Context as _;
 use sqlx::types::chrono::NaiveDateTime;
-use zksync_types::{
-    api, api::TransactionReceipt, Address, L2ChainId, MiniblockNumber, Transaction,
-    ACCOUNT_CODE_STORAGE_ADDRESS, FAILED_CONTRACT_DEPLOYMENT_BYTECODE_HASH, H256, U256,
+use zksync_db_connection::{
+    connection::Connection,
+    error::{DalResult, SqlxContext as _},
+    instrument::InstrumentExt,
+    interpolate_query, match_query_as,
 };
+use zksync_types::{
+    api, api::TransactionReceipt, block::build_bloom, Address, BloomInput, L2BlockNumber,
+    L2ChainId, Transaction, CONTRACT_DEPLOYER_ADDRESS, H256, U256,
+};
+use zksync_vm_interface::VmEvent;
 
 use crate::{
-    instrument::InstrumentExt,
-    models::{
-        storage_block::{bind_block_where_sql_params, web3_block_where_sql},
-        storage_transaction::{
-            extract_web3_transaction, web3_transaction_select_sql, StorageTransaction,
-            StorageTransactionDetails, StorageTransactionReceipt,
-        },
+    models::storage_transaction::{
+        StorageApiTransaction, StorageTransaction, StorageTransactionDetails,
+        StorageTransactionExecutionInfo, StorageTransactionReceipt,
     },
-    SqlxError, StorageProcessor,
+    Core, CoreDal,
 };
+
+#[derive(Debug, Clone, Copy)]
+enum TransactionSelector<'a> {
+    Hashes(&'a [H256]),
+    Position(L2BlockNumber, u32),
+}
 
 #[derive(Debug)]
 pub struct TransactionsWeb3Dal<'a, 'c> {
-    pub(crate) storage: &'a mut StorageProcessor<'c>,
+    pub(crate) storage: &'a mut Connection<'c, Core>,
 }
 
 impl TransactionsWeb3Dal<'_, '_> {
@@ -27,60 +39,71 @@ impl TransactionsWeb3Dal<'_, '_> {
     pub async fn get_transaction_receipts(
         &mut self,
         hashes: &[H256],
-    ) -> Result<Vec<TransactionReceipt>, SqlxError> {
-        let mut receipts: Vec<TransactionReceipt> = sqlx::query_as!(
+    ) -> DalResult<Vec<TransactionReceipt>> {
+        let hash_bytes: Vec<_> = hashes.iter().map(H256::as_bytes).collect();
+
+        // Clarification for first part of the query(`WITH` clause):
+        // Looking for `ContractDeployed` event in the events table
+        // to find the address of deployed contract
+        let st_receipts: Vec<StorageTransactionReceipt> = sqlx::query_as!(
             StorageTransactionReceipt,
             r#"
             WITH
-                sl AS (
-                    SELECT DISTINCT
-                        ON (storage_logs.tx_hash) *
-                    FROM
-                        storage_logs
-                    WHERE
-                        storage_logs.address = $1
-                        AND storage_logs.tx_hash = ANY ($3)
-                    ORDER BY
-                        storage_logs.tx_hash,
-                        storage_logs.miniblock_number DESC,
-                        storage_logs.operation_number DESC
-                )
+            events AS (
+                SELECT DISTINCT
+                ON (events.tx_hash) *
+                FROM
+                    events
+                WHERE
+                    events.address = $1
+                    AND events.topic1 = $2
+                    AND events.tx_hash = ANY($3)
+                ORDER BY
+                    events.tx_hash,
+                    events.event_index_in_tx DESC
+            )
+            
             SELECT
                 transactions.hash AS tx_hash,
-                transactions.index_in_block AS index_in_block,
-                transactions.l1_batch_tx_index AS l1_batch_tx_index,
+                transactions.index_in_block,
+                transactions.l1_batch_tx_index,
                 transactions.miniblock_number AS "block_number!",
-                transactions.error AS error,
-                transactions.effective_gas_price AS effective_gas_price,
-                transactions.initiator_address AS initiator_address,
+                transactions.error,
+                transactions.effective_gas_price,
+                transactions.initiator_address,
                 transactions.data -> 'to' AS "transfer_to?",
                 transactions.data -> 'contractAddress' AS "execute_contract_address?",
                 transactions.tx_format AS "tx_format?",
-                transactions.refunded_gas AS refunded_gas,
-                transactions.gas_limit AS gas_limit,
+                transactions.refunded_gas,
+                transactions.gas_limit,
                 miniblocks.hash AS "block_hash",
                 miniblocks.l1_batch_number AS "l1_batch_number?",
-                sl.key AS "contract_address?"
+                events.topic4 AS "contract_address?",
+                miniblocks.timestamp AS "block_timestamp?"
             FROM
                 transactions
-                JOIN miniblocks ON miniblocks.number = transactions.miniblock_number
-                LEFT JOIN sl ON sl.value != $2
-                AND sl.tx_hash = transactions.hash
+            JOIN miniblocks ON miniblocks.number = transactions.miniblock_number
+            LEFT JOIN events ON events.tx_hash = transactions.hash
             WHERE
-                transactions.hash = ANY ($3)
+                transactions.hash = ANY($3)
+                AND transactions.data != '{}'::jsonb
             "#,
-            ACCOUNT_CODE_STORAGE_ADDRESS.as_bytes(),
-            FAILED_CONTRACT_DEPLOYMENT_BYTECODE_HASH.as_bytes(),
-            &hashes
-                .iter()
-                .map(|h| h.as_bytes().to_vec())
-                .collect::<Vec<_>>()[..]
+            // ^ Filter out transactions with pruned data, which would lead to potentially incomplete / bogus
+            // transaction info.
+            CONTRACT_DEPLOYER_ADDRESS.as_bytes(),
+            VmEvent::DEPLOY_EVENT_SIGNATURE.as_bytes(),
+            &hash_bytes as &[&[u8]],
         )
-        .fetch_all(self.storage.conn())
-        .await?
-        .into_iter()
-        .map(Into::into)
-        .collect();
+        .instrument("get_transaction_receipts")
+        .with_arg("hashes.len", &hashes.len())
+        .fetch_all(self.storage)
+        .await?;
+
+        let block_timestamps: Vec<Option<i64>> =
+            st_receipts.iter().map(|x| x.block_timestamp).collect();
+
+        let mut receipts: Vec<TransactionReceipt> =
+            st_receipts.into_iter().map(Into::into).collect();
 
         let mut logs = self
             .storage
@@ -94,15 +117,23 @@ impl TransactionsWeb3Dal<'_, '_> {
             .get_l2_to_l1_logs_by_hashes(hashes)
             .await?;
 
-        for receipt in &mut receipts {
+        for (receipt, block_timestamp) in receipts.iter_mut().zip(block_timestamps.into_iter()) {
             let logs_for_tx = logs.remove(&receipt.transaction_hash);
 
             if let Some(logs) = logs_for_tx {
+                let iter = logs.iter().flat_map(|log| {
+                    log.topics
+                        .iter()
+                        .map(|topic| BloomInput::Raw(topic.as_bytes()))
+                        .chain(once(BloomInput::Raw(log.address.as_bytes())))
+                });
+                receipt.logs_bloom = build_bloom(iter);
                 receipt.logs = logs
                     .into_iter()
                     .map(|mut log| {
                         log.block_hash = Some(receipt.block_hash);
                         log.l1_batch_number = receipt.l1_batch_number;
+                        log.block_timestamp = block_timestamp.map(|t| (t as u64).into());
                         log
                     })
                     .collect();
@@ -124,99 +155,185 @@ impl TransactionsWeb3Dal<'_, '_> {
         Ok(receipts)
     }
 
-    pub async fn get_transaction(
+    /// Obtains transactions with the specified hashes. Transactions are returned in no particular order; if some hashes
+    /// don't correspond to transactions, the output will contain less elements than `hashes`.
+    pub async fn get_transactions(
         &mut self,
-        transaction_id: api::TransactionId,
+        hashes: &[H256],
         chain_id: L2ChainId,
-    ) -> Result<Option<api::Transaction>, SqlxError> {
-        let where_sql = match transaction_id {
-            api::TransactionId::Hash(_) => "transactions.hash = $1".to_owned(),
-            api::TransactionId::Block(block_id, _) => {
-                format!(
-                    "transactions.index_in_block = $1 AND {}",
-                    web3_block_where_sql(block_id, 2)
-                )
+    ) -> DalResult<Vec<api::Transaction>> {
+        self.get_transactions_inner(TransactionSelector::Hashes(hashes), chain_id)
+            .await
+    }
+
+    pub async fn get_unstable_transaction_execution_info(
+        &mut self,
+        hash: H256,
+    ) -> DalResult<Option<serde_json::Value>> {
+        let row = sqlx::query_as!(
+            StorageTransactionExecutionInfo,
+            r#"
+            SELECT
+                transactions.execution_info
+            FROM
+                transactions
+            WHERE
+                transactions.hash = $1
+            "#,
+            hash.as_bytes()
+        )
+        .instrument("get_unstable_transaction_execution_info")
+        .with_arg("hash", &hash)
+        .fetch_optional(self.storage)
+        .await?;
+        Ok(row.map(|entry| entry.execution_info))
+    }
+
+    async fn get_transactions_inner(
+        &mut self,
+        selector: TransactionSelector<'_>,
+        chain_id: L2ChainId,
+    ) -> DalResult<Vec<api::Transaction>> {
+        if let TransactionSelector::Position(_, idx) = selector {
+            // Since index is not trusted, we check it to prevent potential overflow below.
+            if idx > i32::MAX as u32 {
+                return Ok(vec![]);
             }
-        };
-        let query = format!(
-            "SELECT {}
-            FROM transactions
-            LEFT JOIN miniblocks ON miniblocks.number = transactions.miniblock_number
-            WHERE {where_sql}",
-            web3_transaction_select_sql()
+        }
+
+        let query = match_query_as!(
+            StorageApiTransaction,
+            [
+                r#"
+                SELECT
+                    transactions.hash AS tx_hash,
+                    transactions.index_in_block AS index_in_block,
+                    miniblocks.number AS block_number,
+                    transactions.nonce AS nonce,
+                    transactions.signature AS signature,
+                    transactions.initiator_address AS initiator_address,
+                    transactions.tx_format AS tx_format,
+                    transactions.value AS value,
+                    transactions.gas_limit AS gas_limit,
+                    transactions.max_fee_per_gas AS max_fee_per_gas,
+                    transactions.max_priority_fee_per_gas AS max_priority_fee_per_gas,
+                    transactions.effective_gas_price AS effective_gas_price,
+                    transactions.l1_batch_number AS l1_batch_number,
+                    transactions.l1_batch_tx_index AS l1_batch_tx_index,
+                    transactions.data->'contractAddress' AS "execute_contract_address",
+                    transactions.data->'calldata' AS "calldata",
+                    miniblocks.hash AS "block_hash"
+                FROM transactions
+                LEFT JOIN miniblocks ON miniblocks.number = transactions.miniblock_number
+                WHERE
+                "#,
+                _, // WHERE condition
+                " AND transactions.data != '{}'::jsonb"
+                // ^ Filter out transactions with pruned data, which would lead to potentially incomplete / bogus
+                // transaction info.
+            ],
+            match (selector) {
+                TransactionSelector::Hashes(hashes) => (
+                    "transactions.hash = ANY($1)";
+                    &hashes.iter().map(H256::as_bytes).collect::<Vec<_>>() as &[&[u8]]
+                ),
+                TransactionSelector::Position(block_number, idx) => (
+                    "miniblocks.number = $1 AND transactions.index_in_block = $2";
+                    i64::from(block_number.0),
+                    idx as i32
+                ),
+            }
         );
-        let query = sqlx::query(&query);
 
-        let query = match &transaction_id {
-            api::TransactionId::Hash(tx_hash) => query.bind(tx_hash.as_bytes()),
-            api::TransactionId::Block(block_id, tx_index) => {
-                let tx_index = if tx_index.as_u64() > i32::MAX as u64 {
-                    return Ok(None);
-                } else {
-                    tx_index.as_u64() as i32
-                };
-                bind_block_where_sql_params(block_id, query.bind(tx_index))
-            }
-        };
+        let rows = query
+            .instrument("get_transactions")
+            .with_arg("selector", &selector)
+            .fetch_all(self.storage)
+            .await?;
+        Ok(rows.into_iter().map(|row| row.into_api(chain_id)).collect())
+    }
 
-        let tx = query
-            .fetch_optional(self.storage.conn())
+    pub async fn get_transaction_by_hash(
+        &mut self,
+        hash: H256,
+        chain_id: L2ChainId,
+    ) -> DalResult<Option<api::Transaction>> {
+        Ok(self
+            .get_transactions_inner(TransactionSelector::Hashes(&[hash]), chain_id)
             .await?
-            .map(|row| extract_web3_transaction(row, chain_id));
-        Ok(tx)
+            .into_iter()
+            .next())
+    }
+
+    pub async fn get_transaction_by_position(
+        &mut self,
+        block_number: L2BlockNumber,
+        index_in_block: u32,
+        chain_id: L2ChainId,
+    ) -> DalResult<Option<api::Transaction>> {
+        Ok(self
+            .get_transactions_inner(
+                TransactionSelector::Position(block_number, index_in_block),
+                chain_id,
+            )
+            .await?
+            .into_iter()
+            .next())
     }
 
     pub async fn get_transaction_details(
         &mut self,
         hash: H256,
-    ) -> Result<Option<api::TransactionDetails>, SqlxError> {
-        {
-            let storage_tx_details: Option<StorageTransactionDetails> = sqlx::query_as!(
-                StorageTransactionDetails,
-                r#"
-                SELECT
-                    transactions.is_priority,
-                    transactions.initiator_address,
-                    transactions.gas_limit,
-                    transactions.gas_per_pubdata_limit,
-                    transactions.received_at,
-                    transactions.miniblock_number,
-                    transactions.error,
-                    transactions.effective_gas_price,
-                    transactions.refunded_gas,
-                    commit_tx.tx_hash AS "eth_commit_tx_hash?",
-                    prove_tx.tx_hash AS "eth_prove_tx_hash?",
-                    execute_tx.tx_hash AS "eth_execute_tx_hash?"
-                FROM
-                    transactions
-                    LEFT JOIN miniblocks ON miniblocks.number = transactions.miniblock_number
-                    LEFT JOIN l1_batches ON l1_batches.number = miniblocks.l1_batch_number
-                    LEFT JOIN eth_txs_history AS commit_tx ON (
-                        l1_batches.eth_commit_tx_id = commit_tx.eth_tx_id
-                        AND commit_tx.confirmed_at IS NOT NULL
-                    )
-                    LEFT JOIN eth_txs_history AS prove_tx ON (
-                        l1_batches.eth_prove_tx_id = prove_tx.eth_tx_id
-                        AND prove_tx.confirmed_at IS NOT NULL
-                    )
-                    LEFT JOIN eth_txs_history AS execute_tx ON (
-                        l1_batches.eth_execute_tx_id = execute_tx.eth_tx_id
-                        AND execute_tx.confirmed_at IS NOT NULL
-                    )
-                WHERE
-                    transactions.hash = $1
-                "#,
-                hash.as_bytes()
-            )
-            .instrument("get_transaction_details")
-            .with_arg("hash", &hash)
-            .fetch_optional(self.storage)
-            .await?;
+    ) -> DalResult<Option<api::TransactionDetails>> {
+        let row = sqlx::query_as!(
+            StorageTransactionDetails,
+            r#"
+            SELECT
+                transactions.is_priority,
+                transactions.initiator_address,
+                transactions.gas_limit,
+                transactions.gas_per_pubdata_limit,
+                transactions.received_at,
+                miniblocks.number AS "miniblock_number?",
+                transactions.error,
+                transactions.effective_gas_price,
+                transactions.refunded_gas,
+                commit_tx.tx_hash AS "eth_commit_tx_hash?",
+                prove_tx.tx_hash AS "eth_prove_tx_hash?",
+                execute_tx.tx_hash AS "eth_execute_tx_hash?"
+            FROM
+                transactions
+            LEFT JOIN miniblocks ON miniblocks.number = transactions.miniblock_number
+            LEFT JOIN l1_batches ON l1_batches.number = miniblocks.l1_batch_number
+            LEFT JOIN eth_txs_history AS commit_tx
+                ON (
+                    l1_batches.eth_commit_tx_id = commit_tx.eth_tx_id
+                    AND commit_tx.confirmed_at IS NOT NULL
+                )
+            LEFT JOIN eth_txs_history AS prove_tx
+                ON (
+                    l1_batches.eth_prove_tx_id = prove_tx.eth_tx_id
+                    AND prove_tx.confirmed_at IS NOT NULL
+                )
+            LEFT JOIN eth_txs_history AS execute_tx
+                ON (
+                    l1_batches.eth_execute_tx_id = execute_tx.eth_tx_id
+                    AND execute_tx.confirmed_at IS NOT NULL
+                )
+            WHERE
+                transactions.hash = $1
+                AND transactions.data != '{}'::jsonb
+            "#,
+            // ^ Filter out transactions with pruned data, which would lead to potentially incomplete / bogus
+            // transaction info.
+            hash.as_bytes()
+        )
+        .instrument("get_transaction_details")
+        .with_arg("hash", &hash)
+        .fetch_optional(self.storage)
+        .await?;
 
-            let tx = storage_tx_details.map(|tx_details| tx_details.into());
-
-            Ok(tx)
-        }
+        Ok(row.map(Into::into))
     }
 
     /// Returns hashes of txs which were received after `from_timestamp` and the time of receiving the last tx.
@@ -224,7 +341,7 @@ impl TransactionsWeb3Dal<'_, '_> {
         &mut self,
         from_timestamp: NaiveDateTime,
         limit: Option<usize>,
-    ) -> Result<(Vec<H256>, Option<NaiveDateTime>), SqlxError> {
+    ) -> DalResult<Vec<(NaiveDateTime, H256)>> {
         let records = sqlx::query!(
             r#"
             SELECT
@@ -232,7 +349,6 @@ impl TransactionsWeb3Dal<'_, '_> {
                 transactions.received_at
             FROM
                 transactions
-                LEFT JOIN miniblocks ON miniblocks.number = miniblock_number
             WHERE
                 received_at > $1
             ORDER BY
@@ -243,15 +359,17 @@ impl TransactionsWeb3Dal<'_, '_> {
             from_timestamp,
             limit.map(|limit| limit as i64)
         )
-        .fetch_all(self.storage.conn())
+        .instrument("get_pending_txs_hashes_after")
+        .with_arg("from_timestamp", &from_timestamp)
+        .with_arg("limit", &limit)
+        .fetch_all(self.storage)
         .await?;
 
-        let last_loc = records.last().map(|record| record.received_at);
         let hashes = records
             .into_iter()
-            .map(|record| H256::from_slice(&record.hash))
+            .map(|record| (record.received_at, H256::from_slice(&record.hash)))
             .collect();
-        Ok((hashes, last_loc))
+        Ok(hashes)
     }
 
     /// `committed_next_nonce` should equal the nonce for `initiator_address` in the storage.
@@ -259,7 +377,7 @@ impl TransactionsWeb3Dal<'_, '_> {
         &mut self,
         initiator_address: Address,
         committed_next_nonce: u64,
-    ) -> Result<U256, SqlxError> {
+    ) -> DalResult<U256> {
         // Get nonces of non-rejected transactions, starting from the 'latest' nonce.
         // `latest` nonce is used, because it is guaranteed that there are no gaps before it.
         // `(miniblock_number IS NOT NULL OR error IS NULL)` is the condition that filters non-rejected transactions.
@@ -285,7 +403,10 @@ impl TransactionsWeb3Dal<'_, '_> {
             initiator_address.as_bytes(),
             committed_next_nonce as i64
         )
-        .fetch_all(self.storage.conn())
+        .instrument("next_nonce_by_initiator_account#non_rejected_nonces")
+        .with_arg("initiator_address", &initiator_address)
+        .with_arg("committed_next_nonce", &committed_next_nonce)
+        .fetch_all(self.storage)
         .await?
         .into_iter()
         .map(|row| row.nonce as u64)
@@ -304,30 +425,66 @@ impl TransactionsWeb3Dal<'_, '_> {
         Ok(U256::from(pending_nonce))
     }
 
-    /// Returns the server transactions (not API ones) from a certain miniblock.
-    /// Returns an empty list if the miniblock doesn't exist.
-    pub async fn get_raw_miniblock_transactions(
+    /// Returns the server transactions (not API ones) from a L2 block range.
+    pub async fn get_raw_l2_blocks_transactions(
         &mut self,
-        miniblock: MiniblockNumber,
-    ) -> sqlx::Result<Vec<Transaction>> {
+        blocks: std::ops::Range<L2BlockNumber>,
+    ) -> DalResult<HashMap<L2BlockNumber, Vec<Transaction>>> {
+        // Check if range is non-empty, because BETWEEN in SQL in `unordered`.
+        if blocks.is_empty() {
+            return Ok(HashMap::default());
+        }
+        // We do an inner join with `miniblocks.number`, because
+        // transaction insertions are not atomic with miniblock insertion.
         let rows = sqlx::query_as!(
             StorageTransaction,
             r#"
             SELECT
-                *
+                transactions.*
             FROM
                 transactions
+            INNER JOIN miniblocks ON miniblocks.number = transactions.miniblock_number
             WHERE
-                miniblock_number = $1
+                miniblocks.number BETWEEN $1 AND $2
             ORDER BY
+                miniblock_number,
                 index_in_block
             "#,
-            miniblock.0 as i64
+            i64::from(blocks.start.0),
+            i64::from(blocks.end.0 - 1),
         )
-        .fetch_all(self.storage.conn())
+        .try_map(|row| {
+            let to_block_number = |n: Option<i64>| {
+                anyhow::Ok(L2BlockNumber(
+                    n.context("missing")?.try_into().context("overflow")?,
+                ))
+            };
+            Ok((
+                to_block_number(row.miniblock_number).decode_column("miniblock_number")?,
+                Transaction::from(row),
+            ))
+        })
+        .instrument("get_raw_l2_blocks_transactions")
+        .with_arg("blocks", &blocks)
+        .fetch_all(self.storage)
         .await?;
+        let mut txs: HashMap<L2BlockNumber, Vec<Transaction>> = HashMap::new();
+        for (n, tx) in rows {
+            txs.entry(n).or_default().push(tx);
+        }
+        Ok(txs)
+    }
 
-        Ok(rows.into_iter().map(Into::into).collect())
+    /// Returns the server transactions (not API ones) from an L2 block.
+    pub async fn get_raw_l2_block_transactions(
+        &mut self,
+        block: L2BlockNumber,
+    ) -> DalResult<Vec<Transaction>> {
+        Ok(self
+            .get_raw_l2_blocks_transactions(block..block + 1)
+            .await?
+            .remove(&block)
+            .unwrap_or_default())
     }
 }
 
@@ -335,36 +492,39 @@ impl TransactionsWeb3Dal<'_, '_> {
 mod tests {
     use std::collections::HashMap;
 
-    use zksync_types::{
-        block::MiniblockHasher, fee::TransactionExecutionMetrics, l2::L2Tx, Nonce, ProtocolVersion,
-        ProtocolVersionId,
-    };
+    use zksync_types::{l2::L2Tx, Nonce, ProtocolVersion, ProtocolVersionId};
+    use zksync_vm_interface::{tracer::ValidationTraces, TransactionExecutionMetrics};
 
     use super::*;
     use crate::{
-        tests::{create_miniblock_header, mock_execution_result, mock_l2_transaction},
-        ConnectionPool,
+        tests::{create_l2_block_header, mock_execution_result, mock_l2_transaction},
+        ConnectionPool, Core, CoreDal,
     };
 
-    async fn prepare_transactions(conn: &mut StorageProcessor<'_>, txs: Vec<L2Tx>) {
+    async fn prepare_transactions(conn: &mut Connection<'_, Core>, txs: Vec<L2Tx>) {
         conn.blocks_dal()
-            .delete_miniblocks(MiniblockNumber(0))
+            .delete_l2_blocks(L2BlockNumber(0))
             .await
             .unwrap();
 
         for tx in &txs {
             conn.transactions_dal()
-                .insert_transaction_l2(tx.clone(), TransactionExecutionMetrics::default())
-                .await;
+                .insert_transaction_l2(
+                    tx,
+                    TransactionExecutionMetrics::default(),
+                    ValidationTraces::default(),
+                )
+                .await
+                .unwrap();
         }
         conn.blocks_dal()
-            .insert_miniblock(&create_miniblock_header(0))
+            .insert_l2_block(&create_l2_block_header(0))
             .await
             .unwrap();
-        let mut miniblock_header = create_miniblock_header(1);
-        miniblock_header.l2_tx_count = txs.len() as u16;
+        let mut l2_block_header = create_l2_block_header(1);
+        l2_block_header.l2_tx_count = txs.len() as u16;
         conn.blocks_dal()
-            .insert_miniblock(&miniblock_header)
+            .insert_l2_block(&l2_block_header)
             .await
             .unwrap();
 
@@ -374,87 +534,131 @@ mod tests {
             .collect::<Vec<_>>();
 
         conn.transactions_dal()
-            .mark_txs_as_executed_in_miniblock(MiniblockNumber(1), &tx_results, U256::from(1))
-            .await;
+            .mark_txs_as_executed_in_l2_block(
+                L2BlockNumber(1),
+                &tx_results,
+                U256::from(1),
+                ProtocolVersionId::latest(),
+                false,
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn getting_transaction() {
-        let connection_pool = ConnectionPool::test_pool().await;
-        let mut conn = connection_pool.access_storage().await.unwrap();
+        let connection_pool = ConnectionPool::<Core>::test_pool().await;
+        let mut conn = connection_pool.connection().await.unwrap();
         conn.protocol_versions_dal()
-            .save_protocol_version_with_tx(ProtocolVersion::default())
-            .await;
+            .save_protocol_version_with_tx(&ProtocolVersion::default())
+            .await
+            .unwrap();
         let tx = mock_l2_transaction();
         let tx_hash = tx.hash();
         prepare_transactions(&mut conn, vec![tx]).await;
 
-        let block_hash = MiniblockHasher::new(MiniblockNumber(1), 0, H256::zero())
-            .finalize(ProtocolVersionId::latest());
-        let block_ids = [
-            api::BlockId::Number(api::BlockNumber::Latest),
-            api::BlockId::Number(api::BlockNumber::Number(1.into())),
-            api::BlockId::Hash(block_hash),
-        ];
-        let transaction_ids = block_ids
-            .iter()
-            .map(|&block_id| api::TransactionId::Block(block_id, 0.into()))
-            .chain([api::TransactionId::Hash(tx_hash)]);
+        let web3_tx = conn
+            .transactions_web3_dal()
+            .get_transaction_by_position(L2BlockNumber(1), 0, L2ChainId::from(270))
+            .await;
+        let web3_tx = web3_tx.unwrap().unwrap();
+        assert_eq!(web3_tx.hash, tx_hash);
+        assert_eq!(web3_tx.block_number, Some(1.into()));
+        assert_eq!(web3_tx.transaction_index, Some(0.into()));
 
-        for transaction_id in transaction_ids {
+        let web3_tx = conn
+            .transactions_web3_dal()
+            .get_transaction_by_hash(tx_hash, L2ChainId::from(270))
+            .await;
+        let web3_tx = web3_tx.unwrap().unwrap();
+        assert_eq!(web3_tx.hash, tx_hash);
+        assert_eq!(web3_tx.block_number, Some(1.into()));
+        assert_eq!(web3_tx.transaction_index, Some(0.into()));
+
+        for block_number in [0, 2, 100] {
             let web3_tx = conn
                 .transactions_web3_dal()
-                .get_transaction(transaction_id, L2ChainId::from(270))
-                .await;
-            let web3_tx = web3_tx.unwrap().unwrap();
-            assert_eq!(web3_tx.hash, tx_hash);
-            assert_eq!(web3_tx.block_number, Some(1.into()));
-            assert_eq!(web3_tx.transaction_index, Some(0.into()));
-        }
-
-        let transactions_with_bogus_index = block_ids
-            .iter()
-            .map(|&block_id| api::TransactionId::Block(block_id, 1.into()));
-        for transaction_id in transactions_with_bogus_index {
-            let web3_tx = conn
-                .transactions_web3_dal()
-                .get_transaction(transaction_id, L2ChainId::from(270))
+                .get_transaction_by_position(L2BlockNumber(block_number), 0, L2ChainId::from(270))
                 .await;
             assert!(web3_tx.unwrap().is_none());
         }
-
-        let bogus_block_ids = [
-            api::BlockId::Number(api::BlockNumber::Earliest),
-            api::BlockId::Number(api::BlockNumber::Pending),
-            api::BlockId::Number(api::BlockNumber::Number(42.into())),
-            api::BlockId::Hash(H256::zero()),
-        ];
-        let transactions_with_bogus_block = bogus_block_ids
-            .iter()
-            .map(|&block_id| api::TransactionId::Block(block_id, 0.into()));
-        for transaction_id in transactions_with_bogus_block {
+        for index in [1, 2, 100] {
             let web3_tx = conn
                 .transactions_web3_dal()
-                .get_transaction(transaction_id, L2ChainId::from(270))
+                .get_transaction_by_position(L2BlockNumber(1), index, L2ChainId::from(270))
                 .await;
             assert!(web3_tx.unwrap().is_none());
         }
+        let web3_tx = conn
+            .transactions_web3_dal()
+            .get_transaction_by_hash(H256::zero(), L2ChainId::from(270))
+            .await;
+        assert!(web3_tx.unwrap().is_none());
+
+        let execution_info = conn
+            .transactions_web3_dal()
+            .get_unstable_transaction_execution_info(tx_hash)
+            .await
+            .unwrap()
+            .expect("Transaction execution info is missing in the DAL");
+
+        // Check that execution info has at least the circuit statistics field.
+        // If this assertion fails because the transaction execution info format
+        // has changed, replace circuit_statistic with any other valid field
+        assert!(
+            execution_info.get("circuit_statistic").is_some(),
+            "Missing circuit_statistics field"
+        );
+    }
+
+    #[tokio::test]
+    async fn getting_evm_deployment_tx() {
+        let connection_pool = ConnectionPool::<Core>::test_pool().await;
+        let mut conn = connection_pool.connection().await.unwrap();
+        conn.protocol_versions_dal()
+            .save_protocol_version_with_tx(&ProtocolVersion::default())
+            .await
+            .unwrap();
+        let mut tx = mock_l2_transaction();
+        tx.execute.contract_address = None;
+        let tx_hash = tx.hash();
+        prepare_transactions(&mut conn, vec![tx.clone()]).await;
+
+        let fetched_tx = conn
+            .transactions_dal()
+            .get_tx_by_hash(tx_hash)
+            .await
+            .unwrap()
+            .expect("no transaction");
+        let mut fetched_tx = L2Tx::try_from(fetched_tx).unwrap();
+        assert_eq!(fetched_tx.execute.contract_address, None);
+        fetched_tx.raw_bytes = tx.raw_bytes.clone();
+        assert_eq!(fetched_tx, tx);
+
+        let web3_tx = conn
+            .transactions_web3_dal()
+            .get_transaction_by_position(L2BlockNumber(1), 0, L2ChainId::from(270))
+            .await;
+        let web3_tx = web3_tx.unwrap().expect("no transaction");
+        assert_eq!(web3_tx.hash, tx_hash);
+        assert_eq!(web3_tx.to, None);
     }
 
     #[tokio::test]
     async fn getting_receipts() {
-        let connection_pool = ConnectionPool::test_pool().await;
-        let mut conn = connection_pool.access_storage().await.unwrap();
+        let connection_pool = ConnectionPool::<Core>::test_pool().await;
+        let mut conn = connection_pool.connection().await.unwrap();
         conn.protocol_versions_dal()
-            .save_protocol_version_with_tx(ProtocolVersion::default())
-            .await;
+            .save_protocol_version_with_tx(&ProtocolVersion::default())
+            .await
+            .unwrap();
 
         let tx1 = mock_l2_transaction();
         let tx1_hash = tx1.hash();
         let tx2 = mock_l2_transaction();
         let tx2_hash = tx2.hash();
 
-        prepare_transactions(&mut conn, vec![tx1.clone(), tx2.clone()]).await;
+        prepare_transactions(&mut conn, vec![tx1, tx2]).await;
 
         let mut receipts = conn
             .transactions_web3_dal()
@@ -470,26 +674,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn getting_miniblock_transactions() {
-        let connection_pool = ConnectionPool::test_pool().await;
-        let mut conn = connection_pool.access_storage().await.unwrap();
+    async fn getting_receipt_for_evm_deployment_tx() {
+        let connection_pool = ConnectionPool::<Core>::test_pool().await;
+        let mut conn = connection_pool.connection().await.unwrap();
         conn.protocol_versions_dal()
-            .save_protocol_version_with_tx(ProtocolVersion::default())
-            .await;
+            .save_protocol_version_with_tx(&ProtocolVersion::default())
+            .await
+            .unwrap();
+
+        let mut tx = mock_l2_transaction();
+        let tx_hash = tx.hash();
+        tx.execute.contract_address = None;
+        prepare_transactions(&mut conn, vec![tx]).await;
+
+        let receipts = conn
+            .transactions_web3_dal()
+            .get_transaction_receipts(&[tx_hash])
+            .await
+            .unwrap();
+        assert_eq!(receipts.len(), 1);
+        let receipt = receipts.into_iter().next().unwrap();
+        assert_eq!(receipt.transaction_hash, tx_hash);
+        assert_eq!(receipt.to, Some(Address::zero()));
+    }
+
+    #[tokio::test]
+    async fn getting_l2_block_transactions() {
+        let connection_pool = ConnectionPool::<Core>::test_pool().await;
+        let mut conn = connection_pool.connection().await.unwrap();
+        conn.protocol_versions_dal()
+            .save_protocol_version_with_tx(&ProtocolVersion::default())
+            .await
+            .unwrap();
         let tx = mock_l2_transaction();
         let tx_hash = tx.hash();
         prepare_transactions(&mut conn, vec![tx]).await;
 
         let raw_txs = conn
             .transactions_web3_dal()
-            .get_raw_miniblock_transactions(MiniblockNumber(0))
+            .get_raw_l2_block_transactions(L2BlockNumber(0))
             .await
             .unwrap();
         assert!(raw_txs.is_empty());
 
         let raw_txs = conn
             .transactions_web3_dal()
-            .get_raw_miniblock_transactions(MiniblockNumber(1))
+            .get_raw_l2_block_transactions(L2BlockNumber(1))
             .await
             .unwrap();
         assert_eq!(raw_txs.len(), 1);
@@ -498,11 +728,12 @@ mod tests {
 
     #[tokio::test]
     async fn getting_next_nonce_by_initiator_account() {
-        let connection_pool = ConnectionPool::test_pool().await;
-        let mut conn = connection_pool.access_storage().await.unwrap();
+        let connection_pool = ConnectionPool::<Core>::test_pool().await;
+        let mut conn = connection_pool.connection().await.unwrap();
         conn.protocol_versions_dal()
-            .save_protocol_version_with_tx(ProtocolVersion::default())
-            .await;
+            .save_protocol_version_with_tx(&ProtocolVersion::default())
+            .await
+            .unwrap();
 
         let initiator = Address::repeat_byte(1);
         let next_nonce = conn
@@ -520,8 +751,13 @@ mod tests {
             tx.common_data.initiator_address = initiator;
             tx_by_nonce.insert(nonce, tx.clone());
             conn.transactions_dal()
-                .insert_transaction_l2(tx, TransactionExecutionMetrics::default())
-                .await;
+                .insert_transaction_l2(
+                    &tx,
+                    TransactionExecutionMetrics::default(),
+                    ValidationTraces::default(),
+                )
+                .await
+                .unwrap();
         }
 
         let next_nonce = conn
@@ -534,7 +770,8 @@ mod tests {
         // Reject the transaction with nonce 1, so that it'd be not taken into account.
         conn.transactions_dal()
             .mark_tx_as_rejected(tx_by_nonce[&1].hash(), "oops")
-            .await;
+            .await
+            .unwrap();
         let next_nonce = conn
             .transactions_web3_dal()
             .next_nonce_by_initiator_account(initiator, 0)
@@ -542,20 +779,24 @@ mod tests {
             .unwrap();
         assert_eq!(next_nonce, 1.into());
 
-        // Include transactions in a miniblock (including the rejected one), so that they are taken into account again.
-        let mut miniblock = create_miniblock_header(1);
-        miniblock.l2_tx_count = 2;
-        conn.blocks_dal()
-            .insert_miniblock(&miniblock)
-            .await
-            .unwrap();
+        // Include transactions in a L2 block (including the rejected one), so that they are taken into account again.
+        let mut l2_block = create_l2_block_header(1);
+        l2_block.l2_tx_count = 2;
+        conn.blocks_dal().insert_l2_block(&l2_block).await.unwrap();
         let executed_txs = [
             mock_execution_result(tx_by_nonce[&0].clone()),
             mock_execution_result(tx_by_nonce[&1].clone()),
         ];
         conn.transactions_dal()
-            .mark_txs_as_executed_in_miniblock(miniblock.number, &executed_txs, 1.into())
-            .await;
+            .mark_txs_as_executed_in_l2_block(
+                l2_block.number,
+                &executed_txs,
+                1.into(),
+                ProtocolVersionId::latest(),
+                false,
+            )
+            .await
+            .unwrap();
 
         let next_nonce = conn
             .transactions_web3_dal()
@@ -568,8 +809,8 @@ mod tests {
     #[tokio::test]
     async fn getting_next_nonce_by_initiator_account_after_snapshot_recovery() {
         // Emulate snapshot recovery: no transactions with past nonces are present in the storage
-        let connection_pool = ConnectionPool::test_pool().await;
-        let mut conn = connection_pool.access_storage().await.unwrap();
+        let connection_pool = ConnectionPool::<Core>::test_pool().await;
+        let mut conn = connection_pool.connection().await.unwrap();
         let initiator = Address::repeat_byte(1);
         let next_nonce = conn
             .transactions_web3_dal()
@@ -583,8 +824,13 @@ mod tests {
         tx.common_data.nonce = Nonce(1);
         tx.common_data.initiator_address = initiator;
         conn.transactions_dal()
-            .insert_transaction_l2(tx, TransactionExecutionMetrics::default())
-            .await;
+            .insert_transaction_l2(
+                &tx,
+                TransactionExecutionMetrics::default(),
+                ValidationTraces::default(),
+            )
+            .await
+            .unwrap();
 
         let next_nonce = conn
             .transactions_web3_dal()

@@ -1,12 +1,12 @@
 use num::Integer;
 use rand::RngCore;
-use zksync::EthNamespaceClient;
 use zksync_types::api;
 
 use crate::{
     account_pool::SyncWallet,
     all::AllWeighted,
     rng::{LoadtestRng, WeightedRandom},
+    sdk::EthNamespaceClient,
 };
 
 /// Helper enum for generating random block number.
@@ -53,7 +53,7 @@ impl AllWeighted for ApiRequestType {
 pub struct ApiRequest {
     /// Type of the request to be performed.
     pub request_type: ApiRequestType,
-    /// zkSync block number, generated randomly.
+    /// ZKsync block number, generated randomly.
     pub block_number: api::BlockNumber,
 }
 

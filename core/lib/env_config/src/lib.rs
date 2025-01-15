@@ -1,13 +1,11 @@
 use anyhow::Context as _;
 use serde::de::DeserializeOwned;
 
-mod alerts;
 mod api;
 mod chain;
 mod contract_verifier;
 mod contracts;
 mod database;
-mod eth_client;
 mod eth_sender;
 mod eth_watch;
 mod fri_proof_compressor;
@@ -17,16 +15,25 @@ mod fri_prover_group;
 mod fri_witness_generator;
 mod fri_witness_vector_generator;
 mod house_keeper;
-mod kzg;
 pub mod object_store;
 mod observability;
 mod proof_data_handler;
 mod snapshots_creator;
 mod utils;
-mod witness_generator;
 
+mod base_token_adjuster;
+mod da_dispatcher;
+mod external_price_api_client;
+mod external_proof_integration_api;
+mod genesis;
+mod prover_job_monitor;
 #[cfg(test)]
 mod test_utils;
+mod vm_runner;
+mod wallets;
+
+mod da_client;
+mod timestamp_asserter;
 
 pub trait FromEnv: Sized {
     fn from_env() -> anyhow::Result<Self>;

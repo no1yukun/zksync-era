@@ -1,3 +1,4 @@
+pub(crate) use self::vm::MultiVmSubversion;
 pub use self::{
     bootloader_state::BootloaderState,
     old_vm::{
@@ -14,13 +15,6 @@ pub use self::{
     types::internals::ZkSyncVmState,
     utils::transaction_encoding::TransactionVmExt,
     vm::Vm,
-};
-pub use crate::interface::types::{
-    inputs::{L1BatchEnv, L2BlockEnv, SystemEnv, TxExecutionMode, VmExecutionMode},
-    outputs::{
-        BootloaderMemory, CurrentExecutionState, ExecutionResult, FinishedL1Batch, L2Block,
-        Refunds, VmExecutionLogs, VmExecutionResultAndLogs, VmExecutionStatistics, VmMemoryMetrics,
-    },
 };
 
 mod bootloader_state;

@@ -1,7 +1,6 @@
 use zksync_types::{L2ChainId, H256, U256};
-use zksync_utils::bytecode::CompressedBytecodeInfo;
 
-use crate::vm_latest::types::internals::TransactionData;
+use crate::{interface::CompressedBytecodeInfo, vm_latest::types::internals::TransactionData};
 
 /// Information about tx necessary for execution in bootloader.
 #[derive(Debug, Clone)]
@@ -12,7 +11,7 @@ pub(crate) struct BootloaderTx {
     /// Compressed bytecodes, which has been published during this transaction
     pub(crate) compressed_bytecodes: Vec<CompressedBytecodeInfo>,
     /// Refunds for this transaction
-    pub(crate) refund: u32,
+    pub(crate) refund: u64,
     /// Gas overhead
     pub(crate) gas_overhead: u32,
     /// Gas Limit for this transaction. It can be different from the gas limit inside the transaction
@@ -24,7 +23,7 @@ pub(crate) struct BootloaderTx {
 impl BootloaderTx {
     pub(super) fn new(
         tx: TransactionData,
-        predefined_refund: u32,
+        predefined_refund: u64,
         predefined_overhead: u32,
         trusted_gas_limit: U256,
         compressed_bytecodes: Vec<CompressedBytecodeInfo>,

@@ -1,5 +1,6 @@
-use zk_evm_1_4_1::{
-    aux_structures::{MemoryPage, Timestamp},
+use circuit_sequencer_api::INITIAL_MONOTONIC_CYCLE_COUNTER;
+use zk_evm_1_5_0::{
+    aux_structures::{MemoryPage, PubdataCost, Timestamp},
     block_properties::BlockProperties,
     vm_state::{CallStackEntry, PrimitiveValue, VmState},
     witness_trace::DummyTracer,
@@ -9,14 +10,15 @@ use zk_evm_1_4_1::{
         STARTING_BASE_PAGE, STARTING_TIMESTAMP,
     },
 };
-use zkevm_test_harness_1_3_3::INITIAL_MONOTONIC_CYCLE_COUNTER;
-use zksync_state::{StoragePtr, WriteStorage};
 use zksync_system_constants::BOOTLOADER_ADDRESS;
-use zksync_types::{block::MiniblockHasher, Address, MiniblockNumber};
-use zksync_utils::h256_to_u256;
+use zksync_types::{block::L2BlockHasher, h256_to_u256, Address, L2BlockNumber};
 
 use crate::{
-    interface::{L1BatchEnv, L2Block, SystemEnv},
+    interface::{
+        storage::{StoragePtr, WriteStorage},
+        L1BatchEnv, L2Block, SystemEnv,
+    },
+    utils::bytecode::bytes_to_be_words,
     vm_latest::{
         bootloader_state::BootloaderState,
         constants::BOOTLOADER_HEAP_PAGE,
@@ -63,7 +65,7 @@ pub(crate) fn new_vm_state<S: WriteStorage, H: HistoryMode>(
     system_env: &SystemEnv,
     l1_batch_env: &L1BatchEnv,
 ) -> (ZkSyncVmState<S, H>, BootloaderState) {
-    let last_l2_block = if let Some(last_l2_block) = load_last_l2_block(storage.clone()) {
+    let last_l2_block = if let Some(last_l2_block) = load_last_l2_block(&storage) {
         last_l2_block
     } else {
         // This is the scenario of either the first L2 block ever or
@@ -71,9 +73,7 @@ pub(crate) fn new_vm_state<S: WriteStorage, H: HistoryMode>(
         L2Block {
             number: l1_batch_env.first_l2_block.number.saturating_sub(1),
             timestamp: 0,
-            hash: MiniblockHasher::legacy_hash(
-                MiniblockNumber(l1_batch_env.first_l2_block.number) - 1,
-            ),
+            hash: L2BlockHasher::legacy_hash(L2BlockNumber(l1_batch_env.first_l2_block.number) - 1),
         }
     };
 
@@ -83,29 +83,25 @@ pub(crate) fn new_vm_state<S: WriteStorage, H: HistoryMode>(
     let mut memory = SimpleMemory::default();
     let event_sink = InMemoryEventSink::default();
     let precompiles_processor = PrecompilesProcessorWithHistory::<H>::default();
+
     let mut decommittment_processor: DecommitterOracle<false, S, H> =
         DecommitterOracle::new(storage);
-
-    decommittment_processor.populate(
-        vec![(
-            h256_to_u256(system_env.base_system_smart_contracts.default_aa.hash),
-            system_env
-                .base_system_smart_contracts
-                .default_aa
-                .code
-                .clone(),
-        )],
-        Timestamp(0),
-    );
+    let mut initial_bytecodes = vec![(
+        h256_to_u256(system_env.base_system_smart_contracts.default_aa.hash),
+        bytes_to_be_words(&system_env.base_system_smart_contracts.default_aa.code),
+    )];
+    if let Some(evm_emulator) = &system_env.base_system_smart_contracts.evm_emulator {
+        initial_bytecodes.push((
+            h256_to_u256(evm_emulator.hash),
+            bytes_to_be_words(&evm_emulator.code),
+        ));
+    }
+    decommittment_processor.populate(initial_bytecodes, Timestamp(0));
 
     memory.populate(
         vec![(
             BOOTLOADER_CODE_PAGE,
-            system_env
-                .base_system_smart_contracts
-                .bootloader
-                .code
-                .clone(),
+            bytes_to_be_words(&system_env.base_system_smart_contracts.bootloader.code),
         )],
         Timestamp(0),
     );
@@ -117,6 +113,13 @@ pub(crate) fn new_vm_state<S: WriteStorage, H: HistoryMode>(
         Timestamp(0),
     );
 
+    // By convention, default AA is used as a fallback if the EVM emulator is not available.
+    let evm_emulator_code_hash = system_env
+        .base_system_smart_contracts
+        .evm_emulator
+        .as_ref()
+        .unwrap_or(&system_env.base_system_smart_contracts.default_aa)
+        .hash;
     let mut vm = VmState::empty_state(
         storage_oracle,
         memory,
@@ -128,11 +131,12 @@ pub(crate) fn new_vm_state<S: WriteStorage, H: HistoryMode>(
             default_aa_code_hash: h256_to_u256(
                 system_env.base_system_smart_contracts.default_aa.hash,
             ),
+            evm_simulator_code_hash: h256_to_u256(evm_emulator_code_hash),
             zkporter_is_available: system_env.zk_porter_available,
         },
     );
 
-    vm.local_state.callstack.current.ergs_remaining = system_env.gas_limit;
+    vm.local_state.callstack.current.ergs_remaining = system_env.bootloader_gas_limit;
 
     let initial_context = CallStackEntry {
         this_address: BOOTLOADER_ADDRESS,
@@ -147,13 +151,15 @@ pub(crate) fn new_vm_state<S: WriteStorage, H: HistoryMode>(
         heap_bound: BOOTLOADER_MAX_MEMORY,
         aux_heap_bound: BOOTLOADER_MAX_MEMORY,
         exception_handler_location: INITIAL_FRAME_FORMAL_EH_LOCATION,
-        ergs_remaining: system_env.gas_limit,
+        ergs_remaining: system_env.bootloader_gas_limit,
         this_shard_id: 0,
         caller_shard_id: 0,
         code_shard_id: 0,
         is_static: false,
         is_local_frame: false,
         context_u128_value: 0,
+        total_pubdata_spent: PubdataCost(0),
+        stipend: 0,
     };
 
     // We consider the contract that is being run as a bootloader
@@ -161,7 +167,6 @@ pub(crate) fn new_vm_state<S: WriteStorage, H: HistoryMode>(
     vm.local_state.timestamp = STARTING_TIMESTAMP;
     vm.local_state.memory_page_counter = STARTING_BASE_PAGE;
     vm.local_state.monotonic_cycle_counter = INITIAL_MONOTONIC_CYCLE_COUNTER;
-    vm.local_state.current_ergs_per_pubdata_byte = 0;
     vm.local_state.registers[0] = formal_calldata_abi();
 
     // Deleting all the historical records brought by the initial
@@ -175,6 +180,7 @@ pub(crate) fn new_vm_state<S: WriteStorage, H: HistoryMode>(
         system_env.execution_mode,
         bootloader_initial_memory,
         first_l2_block,
+        system_env.version,
     );
 
     (vm, bootloader_state)
